@@ -1,0 +1,13 @@
+.vercel
+.env*
+!.env.example
+.DS_Store
+.playwright-cli/
+.impeccable/
+graphify-out/
+HANDOFF.md
+PLAN.md
+nearby-mobile-directory.png
+artifacts/*
+!artifacts/nearby-desktop-v2.png
+!artifacts/nearby-mobile-final.png

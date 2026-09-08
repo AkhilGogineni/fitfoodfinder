@@ -1,0 +1,11 @@
+{
+  "name": "fit-food-finder",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node --check app.js && node --check data.js && node --check matcher.js && node --check nearby.js && node --check prices.js && node --check api/catalog.js && node --check api/nearby.js && node --check api/nutrition.js && node --check api/prices.js",
+    "test": "node test.mjs",
+    "check": "npm run build && npm test",
+    "start": "set -a && . ./.env.local && set +a && npx --yes vercel@59.11.2 dev --listen 4173"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "buildCommand": "",
+  "outputDirectory": "",
+  "crons": [
+    {
+      "path": "/api/catalog",
+      "schedule": "0 8 * * *"
+    }
+  ]
+}
