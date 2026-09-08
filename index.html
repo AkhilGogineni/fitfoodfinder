@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Match restaurant meals to your remaining calorie and protein targets." />
+    <title>Fit Food Finder — Eat out, stay on target</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="./assets/archivo-black.ttf" as="font" type="font/ttf" crossorigin />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="lookup-active">
+    <!--
+      THESIS: A campus strength log becomes a live meal board; it refuses the generic wellness dashboard and starts with the exact macro gap.
+      OWN-WORLD: Ink navy, fieldhouse cobalt, acid-lime marks, ruled-sheet structure, fixed data columns, and decisive block type.
+      STORY: Set what is left, scan the ranked board, open a meal, and leave knowing the sourced macros and price.
+      FIRST VIEWPORT: A compact masthead sits above a split worksheet: oversized calorie/protein inputs on the left and a live ranked board on the right.
+      FORM: Campus strength log, grounded direction 6 of 7; seed 735fed8c. Split-flap rigor raises fixed columns; HyperCard raises direct manipulation.
+      FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+    -->
+    <section class="lookup-overlay" id="lookup-overlay" role="status" aria-live="polite" aria-label="Loading nearby restaurant menus">
+      <div class="lookup-card">
+        <span class="lookup-kicker">Nearby menu scan</span>
+        <h2 id="lookup-title">Preparing your local results</h2>
+        <p id="lookup-detail">Your browser will ask for location access so we can find nearby restaurants.</p>
+        <progress id="lookup-progress" max="100" value="2" aria-label="Nearby menu lookup progress">2%</progress>
+        <div class="lookup-meta">
+          <span id="lookup-percent" aria-hidden="true">2% complete</span>
+          <span id="lookup-time" aria-hidden="true">Waiting for location approval</span>
+        </div>
+      </div>
+    </section>
+
+    <a class="skip-link" href="#results">Skip to meal results</a>
+
+    <header class="masthead">
+      <a class="wordmark" href="#top" aria-label="Fit Food Finder home">
+        <span class="wordmark-mark" aria-hidden="true">F/F</span>
+        <span>Fit Food Finder</span>
+      </a>
+      <div class="masthead-meta">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="coverage-label">Loading live menus</span>
+        <button class="text-button" id="location-button" type="button">Use my location</button>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="target-board" aria-labelledby="page-title">
+        <div class="target-copy">
+          <h1 id="page-title">Eat out.<br /><span>Stay on target.</span></h1>
+          <p>Tell us what you have left. We’ll rank nearby restaurant meals using sourced macros and menu prices.</p>
+          <div class="ratio-key">
+            <span class="ratio-rule" aria-hidden="true"></span>
+            <strong>Strong ratio</strong>
+            <span>≈ 10 calories / 1g protein</span>
+          </div>
+        </div>
+
+        <form class="target-form" id="target-form">
+          <label class="target-field" for="calorie-target">
+            <span>Calories left</span>
+            <span class="target-input-wrap">
+              <input id="calorie-target" name="calories" type="number" min="0" max="3000" step="10" value="650" inputmode="numeric" />
+              <small>kcal</small>
+            </span>
+          </label>
+          <span class="target-divider" aria-hidden="true">/</span>
+          <label class="target-field" for="protein-target">
+            <span>Protein needed</span>
+            <span class="target-input-wrap">
+              <input id="protein-target" name="protein" type="number" min="0" max="300" step="1" value="50" inputmode="numeric" />
+              <small>grams</small>
+            </span>
+          </label>
+          <div class="target-summary" id="target-summary" aria-live="polite">Target ratio: 13 cal / g</div>
+        </form>
+      </section>
+
+      <section class="finder-shell" aria-label="Meal finder">
+        <aside class="filter-rail" aria-label="Filters">
+          <div class="rail-heading">
+            <span>Find your meal</span>
+            <button class="text-button" id="clear-button" type="button">Reset</button>
+          </div>
+
+          <label class="search-field" for="search-input">
+            <span class="sr-only">Search restaurants, meals, or cuisines</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"></circle><path d="m16 16 4 4"></path></svg>
+            <input id="search-input" type="search" placeholder="Search restaurant or meal" autocomplete="off" list="restaurant-suggestions" />
+            <button id="menu-search-button" type="button">Fetch menu</button>
+            <datalist id="restaurant-suggestions"></datalist>
+          </label>
+
+          <label class="cuisine-filter" for="cuisine-filter">
+            <span>Cuisine</span>
+            <select id="cuisine-filter">
+              <option value="">All cuisines</option>
+            </select>
+          </label>
+
+          <div class="scope-control" id="scope-control" hidden aria-label="Meal location scope">
+            <button id="scope-nearby" type="button" aria-pressed="true">Nearby meals</button>
+            <button id="scope-all" type="button" aria-pressed="false">All meals</button>
+          </div>
+
+          <fieldset class="toggle-group">
+            <legend>Quick filters</legend>
+            <label class="toggle-row">
+              <span>
+                <strong>Strong ratio only</strong>
+                <small>15 cal / protein gram or better</small>
+              </span>
+              <input id="ratio-filter" type="checkbox" />
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+          </fieldset>
+
+          <div class="data-note" id="data-note">
+            <strong>Know what’s real.</strong>
+            <p>Every ranked meal has sourced calories and protein. Live prices appear only when an item strongly matches a price on the nearby restaurant’s official menu; unmatched prices stay blank.</p>
+          </div>
+
+          <div class="location-status" id="location-status" hidden role="status"></div>
+          <section class="nearby-directory" id="nearby-directory" hidden aria-labelledby="nearby-title">
+            <div class="nearby-heading">
+              <strong id="nearby-title">Nearby restaurants</strong>
+              <span id="nearby-count"></span>
+            </div>
+            <div class="nearby-list" id="nearby-list"></div>
+          </section>
+        </aside>
+
+        <section class="results-panel" id="results" aria-labelledby="results-title">
+          <div class="results-toolbar">
+            <div>
+              <h2 id="results-title">Best matches</h2>
+            </div>
+            <label class="sort-control" for="sort-select">
+              <span>Sort</span>
+              <select id="sort-select">
+                <option value="fit">Best fit</option>
+                <option value="ratio">Best ratio</option>
+                <option value="price">Best protein value</option>
+                <option value="protein">Most protein</option>
+                <option value="calories">Lowest calories</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="results-status" id="results-status" aria-live="polite"></div>
+          <div class="meal-list" id="meal-list" aria-busy="true"></div>
+        </section>
+
+        <aside class="meal-detail" id="meal-detail" aria-label="Selected meal details">
+          <div class="detail-placeholder">
+            <span>Pick a row</span>
+            <p>See the full macro and price breakdown.</p>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <footer>
+      <p>Built for decisions, not dietary advice. Restaurant recipes, portions, availability, and prices can change.</p>
+      <a href="#top">Back to targets ↑</a>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
