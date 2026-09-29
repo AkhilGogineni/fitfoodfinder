@@ -35,6 +35,6 @@ OAuth 1.0 requests are signed server-side with HMAC-SHA1 and work with Vercel's 
 npm run check
 ```
 
-After starting the app, select **Use my location**. Nearby names are matched locally against the common-chain catalog first, then every remaining restaurant is looked up automatically in six-restaurant batches. When OpenStreetMap supplies an official website, the app also crawls that location's menu and attaches prices only to strong item-name matches. The selected meal shows separate nutrition and price source links. Manual search remains available for another restaurant at any time.
+After starting the app, select **Use my location**. Nearby names are matched locally against the common-chain catalog first, and nearby chains missing from it are looked up before results appear. Results are usable within a few seconds; independent restaurants and menu prices fill in afterwards in the background. When OpenStreetMap supplies an official website, the app also crawls that location's menu and attaches prices only to strong item-name matches. The selected meal shows separate nutrition and price source links. Manual search remains available for another restaurant at any time.
 
 A completed nearby scan is cached in the browser for six hours, so reloading the page restores the results immediately without repeating location, nutrition, or price requests.

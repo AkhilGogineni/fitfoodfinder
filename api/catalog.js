@@ -1,11 +1,7 @@
 import { commonRestaurants } from "../data.js";
-import { fatSecretMenu } from "./nutrition.js";
+import { fatSecretMenu, mapWithConcurrency, providerConcurrency } from "./nutrition.js";
 
-export const config = { maxDuration: 120 };
-
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
+export const config = { maxDuration: 60 };
 
 export default async function handler(request, response) {
   response.setHeader("Cache-Control", "private, no-store");
@@ -17,24 +13,19 @@ export default async function handler(request, response) {
     return response.status(200).json({ providerConfigured: false, meals: [] });
   }
 
-  const searchDelayMs = Number(process.env.FATSECRET_SEARCH_DELAY_MS ?? 1250);
-  const menus = [];
-  for (let index = 0; index < commonRestaurants.length; index += 1) {
-    const restaurant = commonRestaurants[index];
-    try {
-      menus.push(await fatSecretMenu(restaurant, consumerKey, consumerSecret));
-    } catch (error) {
-      if (error.providerCode === 12) {
-        return response.status(429).json({ error: "The common menu catalog is temporarily rate limited.", code: "provider_rate_limited" });
-      }
-      menus.push({ restaurant, candidates: 0, matches: 0, meals: [], error: error.message });
-    }
-    if (index < commonRestaurants.length - 1 && searchDelayMs > 0) await wait(searchDelayMs);
+  const results = await mapWithConcurrency(commonRestaurants, providerConcurrency(), (restaurant) =>
+    fatSecretMenu(restaurant, consumerKey, consumerSecret));
+  if (results.some((result) => result?.reason?.providerCode === 12)) {
+    return response.status(429).json({ error: "The common menu catalog is temporarily rate limited.", code: "provider_rate_limited" });
   }
+  const menus = results.map((result, index) => result?.status === "fulfilled"
+    ? result.value
+    : { restaurant: commonRestaurants[index], candidates: 0, matches: 0, meals: [], error: result?.reason?.message || "Lookup failed" });
 
   const meals = [...new Map(menus.flatMap((menu) => menu.meals).map((meal) => [meal.id, meal])).values()];
   const lookups = menus.map(({ restaurant, candidates, matches, error }) => ({ restaurant, candidates, matches, ...(error ? { error } : {}) }));
   response.setHeader("Cache-Control", "public, max-age=300, must-revalidate");
-  response.setHeader("Vercel-CDN-Cache-Control", "public, max-age=82800");
+  // Serve the previous catalog while a refresh runs; 22h fresh + 2h stale stays within FatSecret's 24h storage limit.
+  response.setHeader("Vercel-CDN-Cache-Control", "public, max-age=79200, stale-while-revalidate=7200");
   return response.status(200).json({ providerConfigured: true, generatedAt: new Date().toISOString(), meals, lookups });
 }

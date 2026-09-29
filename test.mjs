@@ -3,7 +3,7 @@ import { brandAliases, commonRestaurants } from "./data.js";
 import { fitLabel, formatMoney, hasStrongProteinRatio, pricePerProtein, proteinRatio, rankMeals, scoreMeal } from "./matcher.js";
 import { mapNearbyRestaurants } from "./nearby.js";
 import catalogHandler from "./api/catalog.js";
-import nutritionHandler, { mealsFromFatSecret, parseFoodDescription, signedSearchUrl } from "./api/nutrition.js";
+import nutritionHandler, { MAX_RESTAURANTS_PER_REQUEST, mapWithConcurrency, mealsFromFatSecret, parseFoodDescription, sameBrand, signedSearchUrl } from "./api/nutrition.js";
 import { extractPriceEntries } from "./api/prices.js";
 import { matchMenuPrice } from "./prices.js";
 
@@ -149,6 +149,8 @@ await nutritionHandler(
     },
   },
 );
+const nutritionConcurrency = maximumProviderRequests;
+maximumProviderRequests = 0;
 let catalogStatus;
 let catalogBody;
 const catalogHeaders = {};
@@ -179,8 +181,51 @@ assert.equal(handlerStatus, 200);
 assert.deepEqual(handlerBody.searched, ["One", "Two", "Three"]);
 assert.equal(catalogStatus, 200);
 assert.equal(catalogBody.lookups.length, commonRestaurants.length);
-assert.equal(catalogHeaders["Vercel-CDN-Cache-Control"], "public, max-age=82800");
-assert.equal(maximumProviderRequests, 1, "provider searches must run sequentially to avoid FatSecret error 12");
+assert.equal(catalogHeaders["Vercel-CDN-Cache-Control"], "public, max-age=79200, stale-while-revalidate=7200",
+  "an expired catalog must be served while it refreshes, and never beyond FatSecret's 24-hour storage limit");
+const catalogConcurrency = maximumProviderRequests;
+assert.ok(nutritionConcurrency > 1, "nutrition lookups must overlap instead of sleeping between every restaurant");
+assert.ok(nutritionConcurrency <= 6, "nutrition lookups must stay within the concurrency bound");
+assert.ok(catalogConcurrency > 1, "catalog lookups must overlap instead of sleeping between every restaurant");
+assert.ok(catalogConcurrency <= 6, "catalog lookups must stay within the concurrency bound");
+
+// A provider rate-limit (error 12) must stop the remaining lookups rather than hammering the API.
+let attempted = 0;
+const rateLimitedResults = await mapWithConcurrency([1, 2, 3, 4, 5, 6, 7, 8], 2, async (item) => {
+  attempted += 1;
+  if (item === 1) {
+    const error = new Error("Too many actions");
+    error.providerCode = 12;
+    throw error;
+  }
+  return item;
+});
+assert.ok(attempted < 8, "a rate-limit response must stop further provider calls");
+assert.equal(rateLimitedResults[0].reason.providerCode, 12);
+assert.deepEqual(await mapWithConcurrency([1, 2, 3], 2, async (n) => n * 2), [
+  { status: "fulfilled", value: 2 },
+  { status: "fulfilled", value: 4 },
+  { status: "fulfilled", value: 6 },
+], "results must stay in input order regardless of completion order");
+
+// Real chains extend their own brand name; unrelated packaged-goods brands must not match.
+assert.equal(sameBrand("Chipotle Mexican Grill", "Chipotle"), true);
+assert.equal(sameBrand("Domino's Pizza", "Domino's"), true);
+assert.equal(sameBrand("Dunkin' Donuts", "Dunkin'"), true);
+assert.equal(sameBrand("Popeyes Chicken & Biscuits", "Popeyes"), true);
+assert.equal(sameBrand("Blue Ribbon", "Blue Ribbon Sushi Bar & Grill"), true);
+assert.equal(sameBrand("Shake Shack", "Shake Shack"), true);
+assert.equal(sameBrand("Aurora Natural", "Aurora"), false, "packaged-goods brands must not be served as a restaurant menu");
+assert.equal(sameBrand("Smart Pressed Juice", "Pressed"), false, "an unrelated brand must not match on a shared word");
+assert.equal(sameBrand("Alice's Caribbean Kitchen", "Alice"), false);
+assert.equal(sameBrand("Maria", "Anna Maria"), false);
+assert.equal(mealsFromFatSecret("Aurora", { foods: { food: [{
+  brand_name: "Aurora Natural",
+  food_id: "81587",
+  food_name: "Organic Raw Walnuts",
+  food_description: "Per 1/4 cup - Calories: 200kcal | Fat: 20.00g | Carbs: 4.00g | Protein: 5.00g",
+}] } }).meals.length, 0, "grocery items must not appear as a nearby restaurant's menu");
+assert.ok(MAX_RESTAURANTS_PER_REQUEST >= 25, "batches must be large enough to keep round trips low");
 
 const scrapedPrices = extractPriceEntries(`
   <div aria-label="Rotisserie-Style Chicken, $8.49, 310 calories"></div>

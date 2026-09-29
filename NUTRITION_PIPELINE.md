@@ -8,9 +8,9 @@ Turn restaurant names discovered near the user into sourced menu items without m
 
 1. `/api/nearby` discovers named restaurants and cafes from OpenStreetMap.
 2. `nearby.js` normalizes known chains and preserves every independent restaurant or cafe name.
-3. `/api/catalog` refreshes 33 common US chains once daily, searches them sequentially to protect the provider limit, and caches the combined response at Vercel's edge for 23 hours.
+3. `/api/catalog` refreshes 33 common US chains once daily, searches them six at a time, and caches the combined response at Vercel's edge for 22 hours, serving that copy for up to 2 more hours while a refresh runs.
 4. The browser downloads that single shared catalog and immediately keeps meals whose restaurant was found nearby.
-5. Every restaurant without a catalog match is then looked up automatically through `/api/nutrition` in six-restaurant batches. The overlay reports exact completed counts and updates elapsed time, estimated time, and progress between batch completions.
+5. Every restaurant without a catalog match is then looked up automatically through `/api/nutrition` in batches of up to 30, which the server searches six at a time. Only nearby chains hold the progress overlay; independent restaurants fill in afterwards in the background. FatSecret throttles bursts of roughly 100 searches per minute (error 12), so the background pass waits out a throttle while the overlay never does. A reload during the background pass resumes it from the browser cache.
 6. Restaurants without any provider match remain visible and unranked. Manual lookup also remains available.
 7. For every matched result whose nearby venue has an official website, `/api/prices` visits the location page and a small set of same-site menu/order links.
 8. The price extractor reads structured data and accessible menu-card labels, then attaches a price only when the live nutrition item strongly matches one menu item. Ambiguous sizes and conflicting ingredients stay unpriced.
@@ -37,7 +37,7 @@ Provider documentation:
 - Calories and protein are required before an item can enter ranking.
 - Provider results are labeled **Verified database**.
 - The client ships with zero meal records. Every displayed meal comes from the current provider-backed catalog, an automatic lookup for an uncovered nearby restaurant, or an explicit manual lookup.
-- The common catalog is cached at Vercel's edge for 23 hours and refreshed by a once-daily Vercel Cron job, within FatSecret's 24-hour content-storage limit.
+- The common catalog is cached at Vercel's edge for 22 hours plus up to 2 hours of stale-while-revalidate, and refreshed by a once-daily Vercel Cron job, within FatSecret's 24-hour content-storage limit.
 - Matched prices link to the exact menu page that supplied them. Unknown or ambiguous prices display as an em dash and do not participate in price sorting.
 - Successful price lookups are cached at Vercel's edge for six hours. The endpoint validates every URL and redirect and blocks private network addresses before fetching.
 - A completed nearby scan is cached in the browser for six hours. A reload restores the venue, nutrition, and price data without calling any API again.

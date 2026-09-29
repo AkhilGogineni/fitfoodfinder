@@ -42,13 +42,19 @@ const state = {
   locationLabel: "",
   liveMeals: [],
   checkedPriceWebsites: new Set(),
+  scanComplete: false,
 };
 
-const NEARBY_CACHE_KEY = "fitfoodfinder:nearby:v2";
+const NEARBY_CACHE_KEY = "fitfoodfinder:nearby:v3";
+// Matches MAX_RESTAURANTS_PER_REQUEST in api/nutrition.js, which searches each batch with bounded concurrency.
+const NUTRITION_BATCH_SIZE = 30;
+const PRICE_BATCH_SIZE = 6;
 const NEARBY_CACHE_TTL = 6 * 60 * 60 * 1000;
 const coveredRestaurants = new Set();
 const commonRestaurantSet = new Set(commonRestaurants);
 let commonCatalogPromise;
+// Bumped by every new scan or reset so an older background pass stops touching state.
+let backgroundFillToken = 0;
 
 function nearbyMeals() {
   const nearbyRestaurants = new Set(state.nearbyVenues.map((venue) => venue.restaurant));
@@ -60,8 +66,10 @@ function saveNearbyCache() {
     const nearbyRestaurants = new Set(state.nearbyVenues.map((venue) => venue.restaurant));
     localStorage.setItem(NEARBY_CACHE_KEY, JSON.stringify({
       savedAt: Date.now(),
+      complete: state.scanComplete,
       venues: state.nearbyVenues,
       meals: state.liveMeals.filter((meal) => nearbyRestaurants.has(meal.restaurant)),
+      checkedPriceWebsites: [...state.checkedPriceWebsites],
     }));
   } catch {
     // Storage can be unavailable in private browsing; live lookup still works.
@@ -76,7 +84,8 @@ function restoreNearbyCache() {
     state.nearbyVenues = cached.venues;
     state.liveMeals = cached.meals;
     state.nearbyBrands = new Set(cached.venues.filter((venue) => venue.hasNutrition).map((venue) => venue.restaurant));
-    state.checkedPriceWebsites = new Set(cached.venues.map((venue) => venue.website).filter(Boolean));
+    state.checkedPriceWebsites = new Set(Array.isArray(cached.checkedPriceWebsites) ? cached.checkedPriceWebsites : []);
+    state.scanComplete = cached.complete === true;
     state.nearbyOnly = true;
     state.locationLabel = "you";
     cached.meals.forEach((meal) => coveredRestaurants.add(meal.restaurant));
@@ -274,6 +283,7 @@ function renderDetail() {
 }
 
 function resetFilters() {
+  backgroundFillToken += 1;
   elements.search.value = "";
   elements.cuisine.value = "";
   elements.ratioFilter.checked = false;
@@ -324,14 +334,14 @@ function startCatalogProgress() {
 
   const render = () => {
     const elapsed = elapsedSeconds(startedAt);
-    const progress = Math.min(24, 6 + elapsed * 18 / 45 + (nearbyCount === null ? 0 : 2));
+    const progress = Math.min(24, 6 + elapsed * 18 / 15 + (nearbyCount === null ? 0 : 2));
     const detail = nearbyCount === null
       ? "Finding nearby restaurants and loading sourced menus."
       : `${nearbyCount} nearby restaurant${nearbyCount === 1 ? "" : "s"} found · loading sourced menus`;
     const timing = elapsed < 3
       ? `${elapsed}s elapsed · checking the shared menu cache`
-      : elapsed < 45
-        ? `${elapsed}s elapsed · about ${roundedSeconds(45 - elapsed)}s left in this stage if menus need refreshing`
+      : elapsed < 15
+        ? `${elapsed}s elapsed · about ${roundedSeconds(15 - elapsed)}s left in this stage if menus need refreshing`
         : `${elapsed}s elapsed · this refresh is taking longer than usual`;
     updateLookupOverlay(nearbyCount === null ? "Finding nearby restaurants" : "Matching nearby menus", detail, progress, timing);
   };
@@ -362,11 +372,12 @@ function startRestaurantProgress(total) {
 
   const render = () => {
     const elapsed = elapsedSeconds(startedAt);
-    const batchDuration = Math.max(4000, batchSize * 1400);
+    // The server searches each batch concurrently, so a batch takes about a second regardless of size.
+    const batchDuration = Math.max(1500, batchSize * 100);
     const estimatedBatchProgress = batchSize * 0.85 * Math.min(1, (Date.now() - batchStartedAt) / batchDuration);
     const effectiveCompleted = Math.min(total, completed + estimatedBatchProgress);
     const progress = 26 + 48 * effectiveCompleted / total;
-    const secondsPerRestaurant = completed ? Math.max(1.25, elapsed / Math.max(1, effectiveCompleted)) : 1.4;
+    const secondsPerRestaurant = completed ? elapsed / Math.max(1, effectiveCompleted) : 0.1;
     const remaining = secondsPerRestaurant * (total - effectiveCompleted);
     const detail = completed
       ? `${completed} of ${total} restaurant menus completed${batchSize ? " · current batch in progress" : ""}`
@@ -451,7 +462,7 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function fetchNutritionBatch(restaurants) {
+async function fetchNutritionBatch(restaurants, { waitOutRateLimit = true } = {}) {
   const url = `/api/nutrition?restaurants=${encodeURIComponent(restaurants.join(","))}`;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let response;
@@ -468,7 +479,7 @@ async function fetchNutritionBatch(restaurants) {
 
     const error = new Error(data.error || `Nutrition lookup returned ${response.status}`);
     error.code = data.code;
-    if (error.code !== "provider_rate_limited" || attempt === 2) throw error;
+    if (error.code !== "provider_rate_limited" || !waitOutRateLimit || attempt === 2) throw error;
     await wait(20000 * (attempt + 1));
   }
 }
@@ -483,6 +494,10 @@ function loadCommonCatalog() {
         throw error;
       }
       return data;
+    });
+    // A failed download must not be reused by the next location attempt.
+    commonCatalogPromise.catch(() => {
+      commonCatalogPromise = undefined;
     });
   }
   return commonCatalogPromise;
@@ -533,7 +548,7 @@ function refreshCatalogControls() {
   elements.coverage.textContent = state.liveMeals.length ? `${state.liveMeals.length} sourced meals` : "Live menu lookup";
 }
 
-async function enrichLivePrices() {
+async function enrichLivePrices({ background = false, isCurrent = () => true } = {}) {
   const groups = new Map();
   state.liveMeals.filter((meal) => meal.price == null).forEach((meal) => {
     const venue = state.nearbyVenues.find((item) => item.restaurant === meal.restaurant && item.website);
@@ -544,17 +559,20 @@ async function enrichLivePrices() {
   if (!menus.length) return 0;
 
   const before = state.liveMeals.filter((meal) => meal.price != null).length;
-  const progress = startPriceProgress(menus.length);
-  setLocationMessage(`Nutrition loaded. Checking prices on ${menus.length} official menu${menus.length === 1 ? "" : "s"}…`);
+  const progress = background
+    ? { beginBatch() {}, completeBatch() {}, stop() {} }
+    : startPriceProgress(menus.length);
+  if (!background) setLocationMessage(`Nutrition loaded. Checking prices on ${menus.length} official menu${menus.length === 1 ? "" : "s"}…`);
   try {
-    for (let index = 0; index < menus.length; index += 3) {
-      const batch = menus.slice(index, index + 3);
+    for (let index = 0; index < menus.length; index += PRICE_BATCH_SIZE) {
+      const batch = menus.slice(index, index + PRICE_BATCH_SIZE);
       progress.beginBatch(batch.length);
       const results = await Promise.allSettled(batch.map(async ({ restaurant, website }) => {
         const response = await fetch(`/api/prices?restaurant=${encodeURIComponent(restaurant)}&website=${encodeURIComponent(website)}`);
         if (!response.ok) throw new Error(`Price lookup returned ${response.status}`);
         return response.json();
       }));
+      if (!isCurrent()) break;
       results.forEach((result, resultIndex) => {
         if (result.status !== "fulfilled") return;
         const menu = batch[resultIndex];
@@ -567,7 +585,9 @@ async function enrichLivePrices() {
       });
       const completed = Math.min(index + batch.length, menus.length);
       progress.completeBatch(completed);
-      setLocationMessage(`Nutrition loaded. Checked ${completed} of ${menus.length} official menus for prices…`);
+      renderResults({ preserveSelection: true });
+      saveNearbyCache();
+      if (!background) setLocationMessage(`Nutrition loaded. Checked ${completed} of ${menus.length} official menus for prices…`);
     }
   } finally {
     progress.stop();
@@ -575,13 +595,16 @@ async function enrichLivePrices() {
   return state.liveMeals.filter((meal) => meal.price != null).length - before;
 }
 
-async function enrichRemainingNutrition(candidates) {
+async function enrichRemainingNutrition(candidates, { background = false, isCurrent = () => true } = {}) {
   if (!candidates.length) return { error: null, checked: 0 };
 
   const candidateSet = new Set(candidates);
   const checked = new Set();
   const failed = new Set();
-  const progress = startRestaurantProgress(candidates.length);
+  // Background passes fill in quietly: no overlay, no status-line takeover.
+  const progress = background
+    ? { beginBatch() {}, completeBatch() {}, stop() {} }
+    : startRestaurantProgress(candidates.length);
   state.nearbyVenues = state.nearbyVenues.map((venue) => candidateSet.has(venue.restaurant)
     ? { ...venue, nutritionStatus: "checking" }
     : venue);
@@ -589,10 +612,13 @@ async function enrichRemainingNutrition(candidates) {
 
   let lookupError = null;
   try {
-    for (let index = 0; index < candidates.length; index += 6) {
-      const batch = candidates.slice(index, index + 6);
+    // One request at a time keeps provider concurrency at the server's bound.
+    for (let index = 0; index < candidates.length; index += NUTRITION_BATCH_SIZE) {
+      const batch = candidates.slice(index, index + NUTRITION_BATCH_SIZE);
       progress.beginBatch(batch.length);
-      const data = await fetchNutritionBatch(batch);
+      // Only the background pass waits out the provider's rate limit; the overlay never should.
+      const data = await fetchNutritionBatch(batch, { waitOutRateLimit: background });
+      if (!isCurrent()) break;
       if (data.providerConfigured === false) {
         const error = new Error("The nutrition provider is not connected.");
         error.code = "provider_missing";
@@ -628,10 +654,12 @@ async function enrichRemainingNutrition(candidates) {
       renderResults({ preserveSelection: true });
       const completed = Math.min(index + batch.length, candidates.length);
       progress.completeBatch(completed);
-      setLocationMessage(`${state.nearbyVenues.length} nearby restaurants found. Completed ${completed} of ${candidates.length} remaining menu lookups…`);
+      saveNearbyCache();
+      if (!background) setLocationMessage(`${state.nearbyVenues.length} nearby restaurants found. Completed ${completed} of ${candidates.length} remaining menu lookups…`);
     }
   } catch (error) {
     lookupError = error;
+    if (!isCurrent()) return { error: lookupError, checked: checked.size };
     const matched = new Set(state.liveMeals.map((meal) => meal.restaurant));
     state.nearbyVenues = state.nearbyVenues.map((venue) => candidateSet.has(venue.restaurant) && !matched.has(venue.restaurant) && !checked.has(venue.restaurant)
       ? { ...venue, hasNutrition: false, nutritionStatus: "lookup-failed" }
@@ -642,6 +670,26 @@ async function enrichRemainingNutrition(candidates) {
   }
 
   return { error: lookupError, checked: checked.size };
+}
+
+async function fillRemainingInBackground(restaurants, baseMessage) {
+  const token = (backgroundFillToken += 1);
+  const isCurrent = () => token === backgroundFillToken;
+  try {
+    // Nutrition lookups take seconds, so finish the long tail first and price everything in one pass.
+    await enrichRemainingNutrition(restaurants, { background: true, isCurrent });
+    if (!isCurrent()) return;
+    await enrichLivePrices({ background: true, isCurrent });
+    if (!isCurrent()) return;
+    const loaded = nearbyMeals();
+    const priced = loaded.filter((meal) => meal.price != null).length;
+    setLocationMessage(`${state.nearbyVenues.length} nearby restaurants checked. ${state.nearbyBrands.size} returned ${loaded.length} menu items; ${priced} item${priced === 1 ? " has" : "s have"} prices.`);
+    state.scanComplete = true;
+    saveNearbyCache();
+  } catch {
+    // The foreground results already stand; a failed background pass leaves them untouched.
+    if (isCurrent()) setLocationMessage(baseMessage);
+  }
 }
 
 async function fetchSearchedRestaurant() {
@@ -751,9 +799,12 @@ async function useLocation() {
   elements.locationButton.textContent = "Checking…";
   setLocationMessage("Requesting your location, then discovering restaurants and cafes within about 3 miles.");
   updateLookupOverlay("Find restaurants near you", "Approve the browser location request to match nearby restaurants with sourced menus.", 3, "Waiting for location approval");
+  backgroundFillToken += 1;
+  state.scanComplete = false;
+  // The catalog does not depend on location, so download it while the permission prompt is open.
+  const catalogPromise = loadCommonCatalog().then((data) => ({ data }), (error) => ({ error }));
   try {
     const position = await getPosition();
-    const catalogPromise = loadCommonCatalog().then((data) => ({ data }), (error) => ({ error }));
     catalogProgress = startCatalogProgress();
     const venues = await fetchNearbyRestaurants(position.coords.latitude, position.coords.longitude);
     state.nearbyVenues = venues.map((venue) => ({
@@ -802,23 +853,35 @@ async function useLocation() {
       return { ...venue, hasNutrition: false, nutritionStatus: "checking" };
     });
     state.nearbyBrands = new Set(state.nearbyVenues.filter((venue) => venue.hasNutrition).map((venue) => venue.restaurant));
-    const remainingRestaurants = [...new Set(state.nearbyVenues
-      .filter((venue) => !matchedRestaurants.has(venue.restaurant))
-      .map((venue) => venue.restaurant))];
-    catalogProgress.complete(state.liveMeals.length, remainingRestaurants.length ? 25 : 72);
+    const unmatched = state.nearbyVenues.filter((venue) => !matchedRestaurants.has(venue.restaurant));
+    // Chains are the venues that realistically carry sourced menus, so they gate the first paint.
+    // Independents are a long tail with a low hit rate; they fill in after the app is usable.
+    const chainRestaurants = [...new Set(unmatched.filter((venue) => venue.isChain).map((venue) => venue.restaurant))];
+    const independentRestaurants = [...new Set(unmatched.filter((venue) => !venue.isChain).map((venue) => venue.restaurant))]
+      .filter((restaurant) => !chainRestaurants.includes(restaurant));
+    catalogProgress.complete(state.liveMeals.length, chainRestaurants.length ? 25 : 72);
     refreshCatalogControls();
     renderNearbyDirectory();
     renderResults({ preserveSelection: false });
-    const lookupResult = await enrichRemainingNutrition(remainingRestaurants);
-    const pricesAdded = await enrichLivePrices();
-    if (pricesAdded) renderResults({ preserveSelection: true });
+    const lookupResult = await enrichRemainingNutrition(chainRestaurants);
+    // A throttled provider must not hold the overlay; chains it refused join the background pass instead.
+    const throttled = lookupResult.error?.code === "provider_rate_limited";
+    const deferredChains = throttled
+      ? chainRestaurants.filter((restaurant) => state.nearbyVenues.some((venue) => venue.restaurant === restaurant && venue.nutritionStatus === "lookup-failed"))
+      : [];
+    const backgroundRestaurants = [...deferredChains, ...independentRestaurants];
     const loadedMeals = nearbyMeals();
-    const pricedMeals = loadedMeals.filter((meal) => meal.price != null).length;
-    const failureNote = lookupResult.error ? " Some restaurant lookups could not finish." : "";
-    const message = `${state.nearbyVenues.length} nearby restaurants checked. ${state.nearbyBrands.size} returned ${loadedMeals.length} menu items; ${pricedMeals} item${pricedMeals === 1 ? " has" : "s have"} prices.${failureNote}`;
-    setLocationMessage(message, lookupResult.error ? "error" : "info");
-    saveNearbyCache();
+    const failureNote = lookupResult.error && !throttled ? " Some restaurant lookups could not finish." : "";
+    const message = `${state.nearbyVenues.length} nearby restaurants checked. ${state.nearbyBrands.size} returned ${loadedMeals.length} menu items.${failureNote}`;
+    const pendingNote = backgroundRestaurants.length
+      ? ` Still checking ${backgroundRestaurants.length} more restaurants and local prices in the background.`
+      : " Still checking local prices in the background.";
+    setLocationMessage(`${message}${pendingNote}`, failureNote ? "error" : "info");
     finishLookupOverlay(message);
+    // Not awaited: prices and the long tail enrich results that are already on screen. It marks its
+    // restaurants as checking before its first request, so this save lets a reload resume them.
+    fillRemainingInBackground(backgroundRestaurants, message);
+    saveNearbyCache();
   } catch (error) {
     state.nearbyBrands = null;
     state.nearbyVenues = [];
@@ -869,6 +932,13 @@ elements.scopeAll.addEventListener("click", () => setMealScope(false));
 
 if (restoreNearbyCache()) {
   renderCachedNearby();
+  // A reload during the background pass resumes it instead of leaving venues stuck mid-lookup.
+  if (!state.scanComplete) {
+    const unfinished = [...new Set(state.nearbyVenues
+      .filter((venue) => venue.nutritionStatus === "checking")
+      .map((venue) => venue.restaurant))];
+    fillRemainingInBackground(unfinished, elements.locationStatus.textContent);
+  }
 } else {
   refreshCatalogControls();
   renderResults({ preserveSelection: false });

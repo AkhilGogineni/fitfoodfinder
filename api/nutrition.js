@@ -1,11 +1,42 @@
 import { createHmac, randomBytes } from "node:crypto";
 
 const SERVER_URL = "https://platform.fatsecret.com/rest/server.api";
+export const MAX_RESTAURANTS_PER_REQUEST = 30;
 
 export const config = { maxDuration: 30 };
 
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export function providerConcurrency() {
+  // Set FATSECRET_CONCURRENCY=1 to fall back to fully sequential lookups.
+  const configured = Number(process.env.FATSECRET_CONCURRENCY ?? 6);
+  return Number.isFinite(configured) && configured >= 1 ? Math.min(Math.floor(configured), 12) : 6;
+}
+
+// Runs `task` over `items` with a bounded number of in-flight requests, preserving input order.
+// A provider rate-limit (error 12) stops further work: the caller surfaces it rather than hammering.
+export async function mapWithConcurrency(items, limit, task) {
+  const results = new Array(items.length);
+  let next = 0;
+  let rateLimited = false;
+
+  async function worker() {
+    while (next < items.length && !rateLimited) {
+      const index = next;
+      next += 1;
+      try {
+        results[index] = { status: "fulfilled", value: await task(items[index], index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+        if (reason?.providerCode === 12) rateLimited = true;
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return results;
 }
 
 function valueFrom(description, label) {
@@ -22,14 +53,33 @@ export function parseFoodDescription(description = "") {
   };
 }
 
-function normalize(value = "") {
-  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+// Words that legitimately extend a restaurant's own name ("Domino's" -> "Domino's Pizza").
+// Anything else after the name means a different business ("Aurora" -> "Aurora Natural").
+const BRAND_EXTENSION_WORDS = new Set([
+  "american", "asian", "bagels", "bakery", "bar", "barbecue", "bbq", "biscuits", "bistro", "bowls", "brasserie",
+  "burger", "burgers", "cafe", "catering", "chicken", "chinese", "co", "coffee", "company", "creamery", "deli",
+  "diner", "donuts", "doughnuts", "express", "greek", "grill", "grille", "grillhouse", "house", "icecream", "indian",
+  "italian", "japanese", "juice", "kitchen", "korean", "mediterranean", "mexican", "noodle", "noodles", "osteria",
+  "pizza", "pizzeria", "pub", "ramen", "restaurant", "restaurants", "salads", "sandwiches", "seafood", "shack",
+  "shop", "smoothies", "steakhouse", "subs", "sushi", "tacos", "taqueria", "tavern", "thai", "trattoria",
+  "vietnamese", "wings", "yogurt",
+]);
+
+function brandWords(value = "") {
+  return String(value).toLowerCase().replace(/['\u2019]/g, "").replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean);
 }
 
-function sameBrand(left, right) {
-  const leftKey = normalize(left);
-  const rightKey = normalize(right);
-  return Boolean(leftKey && rightKey && (leftKey.includes(rightKey) || rightKey.includes(leftKey)));
+export function sameBrand(left, right) {
+  const leftWords = brandWords(left);
+  const rightWords = brandWords(right);
+  if (!leftWords.length || !rightWords.length) return false;
+  if (leftWords.join("") === rightWords.join("")) return true;
+
+  // One name may extend the other, but only with food-service words.
+  const [longer, shorter] = leftWords.length >= rightWords.length ? [leftWords, rightWords] : [rightWords, leftWords];
+  if (shorter.join("") !== longer.slice(0, shorter.length).join("")) return false;
+  const extension = longer.slice(shorter.length);
+  return extension.length > 0 && extension.every((word) => BRAND_EXTENSION_WORDS.has(word));
 }
 
 function percentEncode(value) {
@@ -125,9 +175,9 @@ export default async function handler(request, response) {
     .split(",")
     .map((name) => name.trim())
     .filter(Boolean)
-    .slice(0, 6);
+    .slice(0, MAX_RESTAURANTS_PER_REQUEST);
   if (!restaurants.length || restaurants.some((name) => name.length > 80)) {
-    return response.status(400).json({ error: "One to six restaurant names are required." });
+    return response.status(400).json({ error: `One to ${MAX_RESTAURANTS_PER_REQUEST} restaurant names are required.` });
   }
 
   try {
@@ -136,26 +186,20 @@ export default async function handler(request, response) {
     if (!consumerKey || !consumerSecret) {
       return response.status(200).json({ providerConfigured: false, meals: [], searched: restaurants });
     }
-    const searchDelayMs = Number(process.env.FATSECRET_SEARCH_DELAY_MS ?? 1250);
-    const menus = [];
-    for (const restaurant of restaurants) {
-      try {
-        menus.push({ status: "fulfilled", value: await fatSecretMenu(restaurant, consumerKey, consumerSecret) });
-      } catch (reason) {
-        menus.push({ status: "rejected", reason });
-        if (reason.providerCode === 12) break;
-      }
-      if (restaurants.length > 1 && searchDelayMs > 0) await wait(searchDelayMs);
-    }
-    const fulfilled = menus.filter((result) => result.status === "fulfilled").map((result) => result.value);
-    const failed = menus.filter((result) => result.status === "rejected");
+    const searchDelayMs = Number(process.env.FATSECRET_SEARCH_DELAY_MS ?? 0);
+    const menus = await mapWithConcurrency(restaurants, providerConcurrency(), async (restaurant, index) => {
+      if (searchDelayMs > 0 && index > 0) await wait(searchDelayMs);
+      return fatSecretMenu(restaurant, consumerKey, consumerSecret);
+    });
+    const fulfilled = menus.filter((result) => result?.status === "fulfilled").map((result) => result.value);
+    const failed = menus.filter((result) => result?.status === "rejected");
     const rateLimited = failed.find((result) => result.reason?.providerCode === 12);
     if (rateLimited) throw rateLimited.reason;
     if (!fulfilled.length && failed.length) throw failed[0].reason;
     const meals = [...new Map(fulfilled.flatMap((result) => result.meals).map((meal) => [meal.id, meal])).values()];
-    const lookups = menus.map((result, index) => result.status === "fulfilled"
+    const lookups = menus.map((result, index) => result?.status === "fulfilled"
       ? { restaurant: result.value.restaurant, candidates: result.value.candidates, matches: result.value.matches }
-      : { restaurant: restaurants[index], candidates: 0, matches: 0, error: result.reason?.message || "Lookup failed" });
+      : { restaurant: restaurants[index], candidates: 0, matches: 0, error: result?.reason?.message || "Lookup failed" });
     response.setHeader("Cache-Control", "public, max-age=60, must-revalidate");
     response.setHeader("Vercel-CDN-Cache-Control", "public, max-age=82800");
     return response.status(200).json({ providerConfigured: true, provider: "FatSecret", meals, searched: restaurants, lookups });
